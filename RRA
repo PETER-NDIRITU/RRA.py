@@ -1,0 +1,125 @@
+import ee
+import streamlit as st
+import geemap
+from shapely.geometry import mapping
+import geopandas as gpd
+
+# Initialize Earth Engine
+ee.Initialize()
+
+# Loading the necessary datasets; Counties, SubCounties, Roads & Buildings
+def load_kenyan_counties():
+    return gpd.read_file("C:/Users/thuku/OneDrive/Documents/GeoSpatial Developments/PyCharm/Road_Reserve_App/Datasets/Counties.shp")
+
+def filter_county_by_name(county, query):
+    return county[county['NAME'].str.contains(query, case=False)]
+
+def load_subcounty():
+    return gpd.read_file("C:/Users/thuku/OneDrive/Documents/GeoSpatial Developments/PyCharm/Road_Reserve_App/Datasets/Sub_county.shp")
+
+def filter_subcounty_by_ADM2_EN(subcounty, query):
+    return subcounty[subcounty['ADM2_EN'].str.contains(query, case=False)]
+
+def load_road():
+    return gpd.read_file("C:/Users/thuku/OneDrive/Documents/GeoSpatial Developments/PyCharm/Road_Reserve_App/Datasets/RoadsKE.shp")
+
+def filter_road_by_highway(road, query):
+    return road[road['highway'].str.contains(query, case=False)]
+
+def load_buildings():
+    return gpd.read_file("C:/Users/thuku/OneDrive/Documents/GeoSpatial Developments/PyCharm/Road_Reserve_App/Datasets/BuildingsKE.shp")
+
+def filter_subcounty_by_county(subcounty, selected_county, selected_subcounty):
+    county_geometry = selected_county.geometry.iloc[0]
+    subcounty_within_county = subcounty[subcounty.intersects(county_geometry)]
+    subcounty_within_county_name = subcounty_within_county[subcounty_within_county['ADM2_EN'] == selected_subcounty]
+
+    if subcounty_within_county_name.empty:
+        st.sidebar.warning(f"No {selected_subcounty} subcounty within the selected County.")
+        return None
+
+    subcounty_within_county_name['geometry'] = subcounty_within_county_name['geometry'].intersection(county_geometry)
+    return subcounty_within_county_name
+
+def geodf_to_ee_featurecollection(geodf):
+    features = []
+    for _, row in geodf.iterrows():
+        geom = ee.Geometry(mapping(row['geometry']))
+        feature = ee.Feature(geom)
+        features.append(feature)
+    return ee.FeatureCollection(features)
+
+def main():
+    st.title("254 Roads Reserves")
+
+    # Load datasets
+    county = load_kenyan_counties()
+    subcounty = load_subcounty()
+    road = load_road()
+    buildings = load_buildings()
+
+    # Sidebar for dataset selections
+    OriginCounty = st.sidebar.selectbox("Select County", county['NAME'].unique())
+    filtered_county = filter_county_by_name(county, OriginCounty)
+
+    # Filter subcounty names based on selected county
+    county_geometry = filtered_county.geometry.iloc[0]
+    subcounty_within_county = subcounty[subcounty.intersects(county_geometry)]
+    available_subcounty = subcounty_within_county['ADM2_EN'].unique()
+
+    countySubcounty = st.sidebar.selectbox("Select Sub-County", available_subcounty)
+    subcounty_within_county_name = filter_subcounty_by_county(subcounty, filtered_county, countySubcounty)
+
+    road_within_subcounty = road[road.intersects(subcounty_within_county_name.geometry.iloc[0])]
+    road_types = road_within_subcounty['highway'].unique()
+
+    road_type = st.sidebar.selectbox("Select Road Type", road_types)
+    filtered_roads = filter_road_by_highway(road_within_subcounty, road_type)
+
+    if st.sidebar.button("Load Buildings"):
+        buildings_within_subcounty = buildings[buildings.intersects(subcounty_within_county_name.geometry.iloc[0])]
+
+        # Convert GeoDataFrames to Earth Engine FeatureCollections
+        ee_filtered_county = geodf_to_ee_featurecollection(filtered_county)
+        ee_subcounty_within_county_name = geodf_to_ee_featurecollection(subcounty_within_county_name)
+        ee_filtered_roads = geodf_to_ee_featurecollection(filtered_roads)
+        ee_buildings_within_subcounty = geodf_to_ee_featurecollection(buildings_within_subcounty)
+
+        # Create a geemap map
+        m = geemap.Map(center=[county_geometry.centroid.y, county_geometry.centroid.x], zoom=10)
+
+        # Add the datasets to the map
+        m.addLayer(ee_filtered_county, {}, "County Boundary")
+        m.addLayer(ee_subcounty_within_county_name, {}, "Sub County")
+        m.addLayer(ee_filtered_roads, {}, "Roads")
+        m.addLayer(ee_buildings_within_subcounty, {}, "Buildings")
+
+        # Buffer analysis
+        buffer_distance = st.sidebar.text_input("Buffer distance (meters)", "50")
+        if st.sidebar.button("Apply buffer"):
+            buffer_distance = int(buffer_distance)
+            buffered_roads = filtered_roads.copy()
+            buffered_roads['geometry'] = buffered_roads.buffer(buffer_distance)
+
+            affected_buildings = buildings_within_subcounty[buildings_within_subcounty.intersects(buffered_roads.unary_union)]
+
+            # Convert buffered roads and affected buildings to Earth Engine FeatureCollections
+            ee_buffered_roads = geodf_to_ee_featurecollection(buffered_roads)
+            ee_affected_buildings = geodf_to_ee_featurecollection(affected_buildings)
+            unaffected_buildings = buildings_within_subcounty[~buildings_within_subcounty.index.isin(affected_buildings.index)]
+            ee_unaffected_buildings = geodf_to_ee_featurecollection(unaffected_buildings)
+
+            # Add the buffer to the map
+            m.addLayer(ee_buffered_roads, {'color': 'green'}, "Buffered Roads")
+
+            # Highlight the affected buildings
+            m.addLayer(ee_affected_buildings, {'color': 'red'}, "Affected Buildings")
+            m.addLayer(ee_unaffected_buildings, {'color': 'blue'}, "Unaffected Buildings")
+
+        # Display the map
+        m.to_streamlit(height=600)
+
+    st.markdown("&copy; Peter Thuku 2024")
+
+if __name__ == "__main__":
+    main()
